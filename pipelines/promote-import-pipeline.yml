@@ -16,7 +16,7 @@ variables:
   - group: adeptia-config
 
 pool:
-  name: SelfHostedAgent
+  vmImage: ubuntu-latest
 
 stages:
   - stage: Setup

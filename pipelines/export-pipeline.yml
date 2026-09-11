@@ -26,7 +26,7 @@ variables:
   - group: adeptia-config
 
 pool:
-  name: SelfHostedAgent
+  vmImage: ubuntu-latest
 
 jobs:
   - job: Export
@@ -53,10 +53,15 @@ jobs:
         displayName: Resolve artifact name
 
       - bash: |
+          echo "=== DEBUG ==="
+          echo "URL: $(EXPORT_APP_URL)"
+          echo "Username: $(ADEPTIA_EXPORT_USERNAME)"
           RESPONSE=$(curl --insecure --silent -X POST \
             -H "Content-Type: application/json" \
             -d "{\"username\":\"$(ADEPTIA_EXPORT_USERNAME)\",\"password\":\"$(ADEPTIA_EXPORT_PASSWORD)\",\"requestFrom\":\"web\"}" \
+            --max-time 30 \
             "$(EXPORT_APP_URL)/rest/login/user")
+          echo "Raw response: $RESPONSE"
           TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
           if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
           echo "##vso[task.setvariable variable=ADEPTIA_TOKEN;isSecret=true]$TOKEN"
