@@ -16,7 +16,7 @@ variables:
   - group: adeptia-config
 
 pool:
-  name: AdeptiaAgentPool
+  vmImage: ubuntu-latest
 
 jobs:
   - deployment: Import

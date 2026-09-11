@@ -38,7 +38,7 @@ variables:
   - group: adeptia-config       # needs: EXPORT_APP_URL
 
 pool:
-  name: AdeptiaAgentPool
+  vmImage: ubuntu-latest
 
 jobs:
   - job: Promote
