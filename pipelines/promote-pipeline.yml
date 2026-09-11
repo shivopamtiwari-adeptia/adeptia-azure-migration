@@ -38,7 +38,7 @@ variables:
   - group: adeptia-config       # needs: EXPORT_APP_URL
 
 pool:
-  vmImage: ubuntu-latest
+  name: SelfHostedAgent
 
 jobs:
   - job: Promote

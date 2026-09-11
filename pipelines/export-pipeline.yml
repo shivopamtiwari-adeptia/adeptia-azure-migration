@@ -26,7 +26,7 @@ variables:
   - group: adeptia-config
 
 pool:
-  vmImage: ubuntu-latest
+  name: SelfHostedAgent
 
 jobs:
   - job: Export

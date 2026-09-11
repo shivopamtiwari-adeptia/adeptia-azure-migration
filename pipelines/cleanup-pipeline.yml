@@ -17,7 +17,7 @@ parameters:
     default: true
 
 pool:
-  vmImage: ubuntu-latest
+  name: SelfHostedAgent
 
 jobs:
   - job: Cleanup
