@@ -1,0 +1,130 @@
+name: Import
+
+trigger: none
+
+parameters:
+  - name: source_zip_name
+    displayName: 'ZIP filename to import (from artifacts/dev or artifacts/qa folder)'
+    type: string
+  - name: target_environment
+    displayName: 'Target environment'
+    type: string
+    values: [QA, Stage, Production]
+
+variables:
+  - group: adeptia-credentials
+  - group: adeptia-config
+
+pool:
+  name: AdeptiaAgentPool
+
+jobs:
+  - deployment: Import
+    environment: ${{ parameters.target_environment }}
+    timeoutInMinutes: 60
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+              persistCredentials: true
+
+            - bash: |
+                echo "=== Available ZIPs in artifacts/qa ==="
+                ls artifacts/qa/*.zip 2>/dev/null || echo "None"
+                echo "=== Available ZIPs in artifacts/dev ==="
+                ls artifacts/dev/*.zip 2>/dev/null || echo "None"
+              displayName: List available ZIPs
+
+            - bash: |
+                ZIP="${{ parameters.source_zip_name }}"
+                if [[ "$ZIP" == *-QA.zip ]]; then FOLDER="artifacts/qa"
+                elif [[ "$ZIP" == *-DEV.zip ]]; then FOLDER="artifacts/dev"
+                else echo "ZIP must end with -QA.zip or -DEV.zip"; exit 1; fi
+                PACKAGE_BASE="${ZIP%-QA.zip}"
+                PACKAGE_BASE="${PACKAGE_BASE%-DEV.zip}"
+                ROLLBACK_NAME="${PACKAGE_BASE}-${{ parameters.target_environment }}-rollback.zip"
+                echo "##vso[task.setvariable variable=SOURCE_ZIP_PATH]${FOLDER}/${ZIP}"
+                echo "##vso[task.setvariable variable=ROLLBACK_ZIP_NAME]$ROLLBACK_NAME"
+                echo "##vso[task.setvariable variable=ROLLBACK_ZIP_PATH]rollback/$ROLLBACK_NAME"
+                echo "##vso[task.setvariable variable=PACKAGE_BASE]$PACKAGE_BASE"
+              displayName: Resolve paths
+
+            - bash: |
+                RESPONSE=$(curl --insecure --silent -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "{\"username\":\"$(ADEPTIA_IMPORT_USERNAME)\",\"password\":\"$(ADEPTIA_IMPORT_PASSWORD)\"}" \
+                  "$(IMPORT_APP_URL)/rest/login/user")
+                TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+                if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+                echo "##vso[task.setvariable variable=ADEPTIA_TOKEN;isSecret=true]$TOKEN"
+                echo "Login successful"
+              displayName: Login to Adeptia
+
+            - bash: |
+                RESPONSE=$(curl --insecure --silent \
+                  -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                  --form "sourceZipFile=@\"$(SOURCE_ZIP_PATH)\"" \
+                  --form "generateRollbackPackage=true" \
+                  "$(IMPORT_APP_URL)/rest/migration/import/execute/$(IMPORT_PKG_ID)")
+                echo "Response: $RESPONSE"
+                SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+                REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+                if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Import trigger failed"; exit 1; fi
+                echo "##vso[task.setvariable variable=REF_ID]$REF_ID"
+                echo "Import triggered. Reference ID: $REF_ID"
+              displayName: Trigger import
+
+            - bash: |
+                STATUS=""
+                for i in $(seq 1 15); do
+                  RESPONSE=$(curl --insecure --silent \
+                    -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                    "$(IMPORT_APP_URL)/rest/migration/status?id=$(REF_ID)")
+                  STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+                  echo "Attempt $i/15: $STATUS"
+                  if [ "$STATUS" = "FINISHED" ]; then break; fi
+                  [ $i -lt 15 ] && sleep 30
+                done
+                if [ "$STATUS" != "FINISHED" ]; then echo "Import timed out"; exit 1; fi
+              displayName: Poll import status
+
+            - bash: |
+                mkdir -p rollback
+                for i in $(seq 1 5); do
+                  HTTP=$(curl --insecure --silent \
+                    --cookie "ACCESS_TOKEN=$(ADEPTIA_TOKEN)" \
+                    "$(IMPORT_APP_URL)/rest/migration/downloadzip?id=$(REF_ID)&type=rollbackzip" \
+                    --output "$(ROLLBACK_ZIP_PATH)" \
+                    --write-out "%{http_code}")
+                  echo "Attempt $i: HTTP $HTTP"
+                  [ "$HTTP" = "200" ] && break
+                  [ $i -lt 5 ] && sleep 30
+                done
+              displayName: Download rollback ZIP
+
+            - bash: |
+                git config user.name "azure-pipelines"
+                git config user.email "ci-service@adeptia.com"
+                git add "$(ROLLBACK_ZIP_PATH)"
+                git diff --cached --quiet || (
+                  git commit -m "rollback: $(ROLLBACK_ZIP_NAME) [imported ${{ parameters.source_zip_name }} to ${{ parameters.target_environment }}]"
+                  git pull --rebase origin main
+                  git push origin HEAD:main
+                )
+              displayName: Commit rollback ZIP
+
+            - bash: |
+                RELEASE_DATE=$(date +%Y-%m-%d)
+                TAG="$(PACKAGE_BASE)-${{ parameters.target_environment }}-${RELEASE_DATE}"
+                git tag -a "$TAG" -m "Imported $(PACKAGE_BASE) to ${{ parameters.target_environment }} on ${RELEASE_DATE}" || echo "Tag already exists, skipping"
+                git push origin "$TAG" || echo "Tag push skipped"
+                echo ""
+                echo "=== Import Summary ==="
+                echo "Package     : $(PACKAGE_BASE)"
+                echo "Imported to : ${{ parameters.target_environment }}"
+                echo "Date        : ${RELEASE_DATE}"
+                echo "Source ZIP  : ${{ parameters.source_zip_name }}"
+                echo "Rollback ZIP: $(ROLLBACK_ZIP_NAME)"
+                echo "Run ID      : $(Build.BuildId)"
+              displayName: Tag release and print summary

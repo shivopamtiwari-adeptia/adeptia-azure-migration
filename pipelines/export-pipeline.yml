@@ -1,0 +1,112 @@
+name: Export
+
+trigger: none
+
+parameters:
+  - name: package_type
+    displayName: 'Change type prefix'
+    type: string
+    values: [SOL, MAP, LIB, DB, HF]
+  - name: module_name
+    displayName: 'Short module name (e.g. PaymentIngestion)'
+    type: string
+  - name: package_version
+    displayName: 'Semantic version (e.g. v1.2.0)'
+    type: string
+  - name: export_environment
+    displayName: 'Export source (DEV = draft | QA = golden)'
+    type: string
+    values: [DEV, QA]
+  - name: export_package_id
+    displayName: 'Export package ID from Adeptia Migration Manager'
+    type: string
+
+variables:
+  - group: adeptia-credentials
+  - group: adeptia-config
+
+pool:
+  name: AdeptiaAgentPool
+
+jobs:
+  - job: Export
+    timeoutInMinutes: 60
+    steps:
+      - checkout: self
+        persistCredentials: true
+
+      - bash: |
+          VERSION="${{ parameters.package_version }}"
+          [[ "$VERSION" != v* ]] && VERSION="v$VERSION"
+          BUILD_DATE=$(date +%Y%m%d)
+          PACKAGE_BASE="${{ parameters.package_type }}-${{ parameters.module_name }}-${VERSION}-B$(Build.BuildId)-${BUILD_DATE}"
+          ENV_LOWER=$(echo '${{ parameters.export_environment }}' | tr '[:upper:]' '[:lower:]')
+          ZIP_NAME="${PACKAGE_BASE}-${{ parameters.export_environment }}.zip"
+          ZIP_FOLDER="artifacts/${ENV_LOWER}"
+          ZIP_PATH="${ZIP_FOLDER}/${ZIP_NAME}"
+          echo "##vso[task.setvariable variable=PACKAGE_BASE]$PACKAGE_BASE"
+          echo "##vso[task.setvariable variable=ZIP_NAME]$ZIP_NAME"
+          echo "##vso[task.setvariable variable=ZIP_FOLDER]$ZIP_FOLDER"
+          echo "##vso[task.setvariable variable=ZIP_PATH]$ZIP_PATH"
+          echo "Package : $PACKAGE_BASE"
+          echo "Artifact: $ZIP_PATH"
+        displayName: Resolve artifact name
+
+      - bash: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"$(ADEPTIA_EXPORT_USERNAME)\",\"password\":\"$(ADEPTIA_EXPORT_PASSWORD)\",\"requestFrom\":\"web\"}" \
+            "$(EXPORT_APP_URL)/rest/login/user")
+          TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+          if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+          echo "##vso[task.setvariable variable=ADEPTIA_TOKEN;isSecret=true]$TOKEN"
+          echo "Login successful"
+        displayName: Login to Adeptia
+
+      - bash: |
+          RESPONSE=$(curl --insecure --silent -X POST \
+            -H "Content-Type: application/json" \
+            -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+            "$(EXPORT_APP_URL)/rest/migration/export/execute/${{ parameters.export_package_id }}")
+          echo "Response: $RESPONSE"
+          REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+          if [ -z "$REF_ID" ]; then echo "Export trigger failed"; exit 1; fi
+          echo "##vso[task.setvariable variable=REF_ID]$REF_ID"
+          echo "Export triggered. Reference ID: $REF_ID"
+        displayName: Trigger export
+
+      - bash: |
+          STATUS=""
+          for i in $(seq 1 15); do
+            RESPONSE=$(curl --insecure --silent \
+              -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+              "$(EXPORT_APP_URL)/rest/migration/status?id=$(REF_ID)")
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+            echo "Attempt $i/15: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then sleep 10; break; fi
+            [ $i -lt 15 ] && sleep 30
+          done
+          if [ "$STATUS" != "FINISHED" ]; then echo "Export timed out"; exit 1; fi
+        displayName: Poll export status
+
+      - bash: |
+          mkdir -p "$(ZIP_FOLDER)"
+          curl --insecure --silent \
+            -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+            "$(EXPORT_APP_URL)/rest/migration/downloadzip?id=$(REF_ID)&type=exportzip" \
+            --output "$(ZIP_PATH)"
+          echo "Downloaded: $(ZIP_NAME)"
+        displayName: Download export ZIP
+
+      - bash: |
+          git config user.name "azure-pipelines"
+          git config user.email "ci-service@adeptia.com"
+          git add "$(ZIP_PATH)"
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "export: $(ZIP_NAME) [run $(Build.BuildId)]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+        displayName: Commit ZIP to repository

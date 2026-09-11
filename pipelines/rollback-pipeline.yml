@@ -1,0 +1,128 @@
+name: Rollback
+
+trigger: none
+
+parameters:
+  - name: source_zip_name
+    displayName: 'Rollback ZIP filename (check rollback/ folder in repo)'
+    type: string
+  - name: target_environment
+    displayName: 'Same environment used during import'
+    type: string
+    values: [QA, Stage, Production]
+
+variables:
+  - group: adeptia-credentials
+  - group: adeptia-config
+
+pool:
+  name: AdeptiaAgentPool
+
+jobs:
+  - deployment: Rollback
+    environment: ${{ parameters.target_environment }}
+    timeoutInMinutes: 60
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+              persistCredentials: true
+
+            - bash: |
+                echo "=== Available rollback ZIPs ==="
+                ls rollback/*.zip 2>/dev/null || echo "None"
+              displayName: List available rollback ZIPs
+
+            - bash: |
+                ZIP="${{ parameters.source_zip_name }}"
+                if [[ "$ZIP" != *-rollback.zip ]]; then echo "ZIP must end with -rollback.zip"; exit 1; fi
+
+                if [[ "$ZIP" == *-QA-rollback.zip ]] && [ "${{ parameters.target_environment }}" != "QA" ]; then
+                  echo "Environment mismatch: ZIP is for QA but target is ${{ parameters.target_environment }}"; exit 1
+                fi
+                if [[ "$ZIP" == *-Stage-rollback.zip ]] && [ "${{ parameters.target_environment }}" != "Stage" ]; then
+                  echo "Environment mismatch: ZIP is for Stage but target is ${{ parameters.target_environment }}"; exit 1
+                fi
+                if [[ "$ZIP" == *-Production-rollback.zip ]] && [ "${{ parameters.target_environment }}" != "Production" ]; then
+                  echo "Environment mismatch: ZIP is for Production but target is ${{ parameters.target_environment }}"; exit 1
+                fi
+
+                MARKER="rollback/executed/${ZIP}.done"
+                if [ -f "$MARKER" ]; then
+                  echo "Duplicate rollback detected — already executed for ${{ parameters.target_environment }}"; exit 1
+                fi
+
+                echo "##vso[task.setvariable variable=ROLLBACK_ZIP_PATH]rollback/$ZIP"
+                echo "##vso[task.setvariable variable=MARKER_PATH]$MARKER"
+              displayName: Validate ZIP and environment
+
+            - bash: |
+                RESPONSE=$(curl --insecure --silent -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "{\"username\":\"$(ADEPTIA_IMPORT_USERNAME)\",\"password\":\"$(ADEPTIA_IMPORT_PASSWORD)\"}" \
+                  "$(IMPORT_APP_URL)/rest/login/user")
+                TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+                if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+                echo "##vso[task.setvariable variable=ADEPTIA_TOKEN;isSecret=true]$TOKEN"
+                echo "Login successful"
+              displayName: Login to Adeptia
+
+            - bash: |
+                RESPONSE=$(curl --insecure --silent \
+                  -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                  --form "sourceZipFile=@\"$(ROLLBACK_ZIP_PATH)\"" \
+                  "$(IMPORT_APP_URL)/rest/migration/rollback/execute/$(IMPORT_PKG_ID)")
+                echo "Response: $RESPONSE"
+                SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+                REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+                if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Rollback trigger failed"; exit 1; fi
+                echo "##vso[task.setvariable variable=REF_ID]$REF_ID"
+                echo "Rollback triggered. Reference ID: $REF_ID"
+              displayName: Trigger rollback
+
+            - bash: |
+                STATUS=""
+                FINAL_RESPONSE=""
+                for i in $(seq 1 15); do
+                  RESPONSE=$(curl --insecure --silent \
+                    -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                    "$(IMPORT_APP_URL)/rest/migration/status?id=$(REF_ID)")
+                  STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+                  echo "Attempt $i/15: $STATUS"
+                  if [ "$STATUS" = "FINISHED" ]; then FINAL_RESPONSE="$RESPONSE"; break; fi
+                  [ $i -lt 15 ] && sleep 30
+                done
+                if [ "$STATUS" != "FINISHED" ]; then echo "Rollback timed out or failed. Last status: $STATUS"; exit 1; fi
+                RESULT=$(echo "$FINAL_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result', d.get('migrationStatus', 'UNKNOWN')))" 2>/dev/null || echo "UNKNOWN")
+                echo "Result: $RESULT"
+                echo "##vso[task.setvariable variable=ROLLBACK_RESULT]$RESULT"
+              displayName: Poll rollback status
+
+            - bash: |
+                mkdir -p migration-logs
+                LOG_FILE="migration-logs/rollback-${{ parameters.source_zip_name }}-${{ parameters.target_environment }}.log"
+                HTTP=$(curl --insecure --silent \
+                  -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                  "$(IMPORT_APP_URL)/rest/migration/logs?id=$(REF_ID)" \
+                  --output "$LOG_FILE" \
+                  --write-out "%{http_code}")
+                echo "Log download HTTP: $HTTP"
+                echo "--- Migration Log ---"
+                cat "$LOG_FILE" || echo "(empty log)"
+              displayName: Download migration log
+
+            - bash: |
+                git config user.name "azure-pipelines"
+                git config user.email "ci-service@adeptia.com"
+                mkdir -p rollback/executed
+                echo "executed: ${{ parameters.source_zip_name }} on ${{ parameters.target_environment }} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  > "$(MARKER_PATH)"
+                LOG_FILE="migration-logs/rollback-${{ parameters.source_zip_name }}-${{ parameters.target_environment }}.log"
+                git add "$(MARKER_PATH)" "$LOG_FILE" 2>/dev/null || true
+                git diff --cached --quiet || (
+                  git commit -m "rollback-executed: ${{ parameters.source_zip_name }} on ${{ parameters.target_environment }} [result=$(ROLLBACK_RESULT)]"
+                  git pull --rebase origin main
+                  git push origin HEAD:main
+                )
+              displayName: Commit log and mark rollback executed

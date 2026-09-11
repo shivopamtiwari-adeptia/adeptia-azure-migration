@@ -1,0 +1,71 @@
+name: Cleanup
+
+trigger: none
+
+parameters:
+  - name: dry_run
+    displayName: 'Dry run — list what would be deleted without deleting'
+    type: boolean
+    default: true
+  - name: delete_old_zips
+    displayName: 'Delete export ZIPs older than 30 days from artifacts/'
+    type: boolean
+    default: true
+  - name: delete_stale_branches
+    displayName: 'Delete merged migration/ branches'
+    type: boolean
+    default: true
+
+pool:
+  name: AdeptiaAgentPool
+
+jobs:
+  - job: Cleanup
+    timeoutInMinutes: 30
+    steps:
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 0
+
+      - bash: |
+          echo "=== Export ZIPs older than 30 days ==="
+          find artifacts/ -name "*.zip" -mtime +30 2>/dev/null | while read f; do
+            echo "  $f"
+            if [ "${{ parameters.dry_run }}" = "False" ]; then
+              git rm "$f"
+            fi
+          done || echo "No old ZIPs found"
+        displayName: Cleanup old export ZIPs
+        condition: eq('${{ parameters.delete_old_zips }}', 'True')
+
+      - bash: |
+          echo "=== Merged migration/ branches ==="
+          git fetch --prune origin
+          git branch -r --merged origin/main | grep 'origin/migration/' | sed 's|origin/||' | while read branch; do
+            echo "  $branch"
+            if [ "${{ parameters.dry_run }}" = "False" ]; then
+              git push origin --delete "$branch"
+              echo "  Deleted: $branch"
+            fi
+          done || echo "No stale branches found"
+        displayName: Cleanup stale migration branches
+        condition: eq('${{ parameters.delete_stale_branches }}', 'True')
+
+      - bash: |
+          git config user.name "azure-pipelines"
+          git config user.email "ci-service@adeptia.com"
+          git diff --cached --quiet || (
+            git commit -m "cleanup: remove old export ZIPs [run $(Build.BuildId)]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          )
+        displayName: Commit deletions
+        condition: and(eq('${{ parameters.dry_run }}', 'False'), eq('${{ parameters.delete_old_zips }}', 'True'))
+
+      - bash: |
+          if [ "${{ parameters.dry_run }}" = "True" ]; then
+            echo "DRY RUN complete — no changes made. Re-run with dry_run=False to apply."
+          else
+            echo "Cleanup complete."
+          fi
+        displayName: Summary

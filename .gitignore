@@ -1,0 +1,7 @@
+# Ignore actual ZIP files in tracking (they are committed intentionally via pipeline)
+# Remove these lines if you want git to track ZIPs normally
+# *.zip
+
+# OS files
+.DS_Store
+Thumbs.db

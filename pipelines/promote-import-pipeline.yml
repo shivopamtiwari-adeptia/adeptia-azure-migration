@@ -1,0 +1,356 @@
+name: Promote Import
+
+# Triggers automatically when a migration/* PR is merged to main
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - promote-config.txt
+
+pr: none
+
+variables:
+  - group: adeptia-credentials
+  - group: adeptia-config
+
+pool:
+  name: AdeptiaAgentPool
+
+stages:
+  - stage: Setup
+    displayName: Read promote config
+    jobs:
+      - job: ReadConfig
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - bash: |
+              if [ ! -f promote-config.txt ]; then echo "promote-config.txt not found"; exit 1; fi
+              ZIP_PATH=$(grep '^ZIP_PATH=' promote-config.txt | cut -d= -f2)
+              TARGET_ENVS=$(grep '^TARGET_ENVS=' promote-config.txt | cut -d= -f2)
+              ZIP_NAME=$(basename "$ZIP_PATH")
+              PACKAGE_BASE="${ZIP_NAME%-QA.zip}"
+              PACKAGE_BASE="${PACKAGE_BASE%-DEV.zip}"
+              echo "##vso[task.setvariable variable=zip_path;isOutput=true]$ZIP_PATH"
+              echo "##vso[task.setvariable variable=zip_name;isOutput=true]$ZIP_NAME"
+              echo "##vso[task.setvariable variable=package_base;isOutput=true]$PACKAGE_BASE"
+              echo "##vso[task.setvariable variable=target_envs;isOutput=true]$TARGET_ENVS"
+              echo "ZIP Path   : $ZIP_PATH"
+              echo "Target Envs: $TARGET_ENVS"
+            name: config
+            displayName: Parse promote config
+
+  - stage: ImportQA
+    displayName: Import to QA
+    dependsOn: Setup
+    condition: |
+      and(
+        succeeded('Setup'),
+        contains(stageDependencies.Setup.ReadConfig.outputs['config.target_envs'], 'QA')
+      )
+    variables:
+      zip_path: $[ stageDependencies.Setup.ReadConfig.outputs['config.zip_path'] ]
+      package_base: $[ stageDependencies.Setup.ReadConfig.outputs['config.package_base'] ]
+    jobs:
+      - deployment: Import
+        environment: QA
+        timeoutInMinutes: 60
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  persistCredentials: true
+
+                - bash: |
+                    RESPONSE=$(curl --insecure --silent -X POST \
+                      -H "Content-Type: application/json" \
+                      -d "{\"username\":\"$(ADEPTIA_IMPORT_USERNAME)\",\"password\":\"$(ADEPTIA_IMPORT_PASSWORD)\"}" \
+                      "$(IMPORT_APP_URL)/rest/login/user")
+                    TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+                    if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+                    echo "##vso[task.setvariable variable=ADEPTIA_TOKEN;isSecret=true]$TOKEN"
+                    echo "Login successful"
+                  displayName: Login to Adeptia
+
+                - bash: |
+                    RESPONSE=$(curl --insecure --silent \
+                      -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                      --form "sourceZipFile=@\"$(zip_path)\"" \
+                      --form "generateRollbackPackage=true" \
+                      "$(IMPORT_APP_URL)/rest/migration/import/execute/$(IMPORT_PKG_ID)")
+                    echo "Response: $RESPONSE"
+                    SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+                    REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+                    if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Import trigger failed for QA: $RESPONSE"; exit 1; fi
+                    echo "##vso[task.setvariable variable=REF_ID]$REF_ID"
+                    echo "Import triggered. Reference ID: $REF_ID"
+                  displayName: Trigger import
+
+                - bash: |
+                    STATUS=""
+                    for i in $(seq 1 15); do
+                      RESPONSE=$(curl --insecure --silent \
+                        -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                        "$(IMPORT_APP_URL)/rest/migration/status?id=$(REF_ID)")
+                      STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+                      echo "Attempt $i/15 [QA]: $STATUS"
+                      if [ "$STATUS" = "FINISHED" ]; then break; fi
+                      [ $i -lt 15 ] && sleep 30
+                    done
+                    if [ "$STATUS" != "FINISHED" ]; then echo "Import timed out for QA"; exit 1; fi
+                  displayName: Poll import status
+
+                - bash: |
+                    ROLLBACK_NAME="$(package_base)-QA-rollback.zip"
+                    ROLLBACK_PATH="rollback/${ROLLBACK_NAME}"
+                    mkdir -p rollback
+                    for r in $(seq 1 5); do
+                      HTTP=$(curl --insecure --silent \
+                        --cookie "ACCESS_TOKEN=$(ADEPTIA_TOKEN)" \
+                        "$(IMPORT_APP_URL)/rest/migration/downloadzip?id=$(REF_ID)&type=rollbackzip" \
+                        --output "$ROLLBACK_PATH" --write-out "%{http_code}")
+                      echo "Rollback download attempt $r: HTTP $HTTP"
+                      [ "$HTTP" = "200" ] && break
+                      [ $r -lt 5 ] && sleep 30
+                    done
+                    git config user.name "azure-pipelines"
+                    git config user.email "ci-service@adeptia.com"
+                    git add "$ROLLBACK_PATH"
+                    git diff --cached --quiet || (
+                      git commit -m "rollback: ${ROLLBACK_NAME} [promoted to QA]"
+                      git pull --rebase origin main
+                      git push origin HEAD:main
+                    )
+                  displayName: Download and commit rollback ZIP
+
+  - stage: ImportStage
+    displayName: Import to Stage
+    dependsOn:
+      - Setup
+      - ImportQA
+    condition: |
+      and(
+        succeeded('Setup'),
+        contains(stageDependencies.Setup.ReadConfig.outputs['config.target_envs'], 'Stage'),
+        in(dependencies.ImportQA.result, 'Succeeded', 'Skipped')
+      )
+    variables:
+      zip_path: $[ stageDependencies.Setup.ReadConfig.outputs['config.zip_path'] ]
+      package_base: $[ stageDependencies.Setup.ReadConfig.outputs['config.package_base'] ]
+    jobs:
+      - deployment: Import
+        environment: Stage
+        timeoutInMinutes: 60
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  persistCredentials: true
+
+                - bash: |
+                    RESPONSE=$(curl --insecure --silent -X POST \
+                      -H "Content-Type: application/json" \
+                      -d "{\"username\":\"$(ADEPTIA_IMPORT_USERNAME)\",\"password\":\"$(ADEPTIA_IMPORT_PASSWORD)\"}" \
+                      "$(IMPORT_APP_URL)/rest/login/user")
+                    TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+                    if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+                    echo "##vso[task.setvariable variable=ADEPTIA_TOKEN;isSecret=true]$TOKEN"
+                    echo "Login successful"
+                  displayName: Login to Adeptia
+
+                - bash: |
+                    RESPONSE=$(curl --insecure --silent \
+                      -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                      --form "sourceZipFile=@\"$(zip_path)\"" \
+                      --form "generateRollbackPackage=true" \
+                      "$(IMPORT_APP_URL)/rest/migration/import/execute/$(IMPORT_PKG_ID)")
+                    echo "Response: $RESPONSE"
+                    SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+                    REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+                    if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Import trigger failed for Stage: $RESPONSE"; exit 1; fi
+                    echo "##vso[task.setvariable variable=REF_ID]$REF_ID"
+                    echo "Import triggered. Reference ID: $REF_ID"
+                  displayName: Trigger import
+
+                - bash: |
+                    STATUS=""
+                    for i in $(seq 1 15); do
+                      RESPONSE=$(curl --insecure --silent \
+                        -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                        "$(IMPORT_APP_URL)/rest/migration/status?id=$(REF_ID)")
+                      STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+                      echo "Attempt $i/15 [Stage]: $STATUS"
+                      if [ "$STATUS" = "FINISHED" ]; then break; fi
+                      [ $i -lt 15 ] && sleep 30
+                    done
+                    if [ "$STATUS" != "FINISHED" ]; then echo "Import timed out for Stage"; exit 1; fi
+                  displayName: Poll import status
+
+                - bash: |
+                    ROLLBACK_NAME="$(package_base)-Stage-rollback.zip"
+                    ROLLBACK_PATH="rollback/${ROLLBACK_NAME}"
+                    mkdir -p rollback
+                    for r in $(seq 1 5); do
+                      HTTP=$(curl --insecure --silent \
+                        --cookie "ACCESS_TOKEN=$(ADEPTIA_TOKEN)" \
+                        "$(IMPORT_APP_URL)/rest/migration/downloadzip?id=$(REF_ID)&type=rollbackzip" \
+                        --output "$ROLLBACK_PATH" --write-out "%{http_code}")
+                      echo "Rollback download attempt $r: HTTP $HTTP"
+                      [ "$HTTP" = "200" ] && break
+                      [ $r -lt 5 ] && sleep 30
+                    done
+                    git config user.name "azure-pipelines"
+                    git config user.email "ci-service@adeptia.com"
+                    git add "$ROLLBACK_PATH"
+                    git diff --cached --quiet || (
+                      git commit -m "rollback: ${ROLLBACK_NAME} [promoted to Stage]"
+                      git pull --rebase origin main
+                      git push origin HEAD:main
+                    )
+                  displayName: Download and commit rollback ZIP
+
+  - stage: ImportProduction
+    displayName: Import to Production
+    dependsOn:
+      - Setup
+      - ImportQA
+      - ImportStage
+    condition: |
+      and(
+        succeeded('Setup'),
+        contains(stageDependencies.Setup.ReadConfig.outputs['config.target_envs'], 'Production'),
+        in(dependencies.ImportQA.result, 'Succeeded', 'Skipped'),
+        in(dependencies.ImportStage.result, 'Succeeded', 'Skipped')
+      )
+    variables:
+      zip_path: $[ stageDependencies.Setup.ReadConfig.outputs['config.zip_path'] ]
+      package_base: $[ stageDependencies.Setup.ReadConfig.outputs['config.package_base'] ]
+    jobs:
+      - deployment: Import
+        environment: Production
+        timeoutInMinutes: 60
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  persistCredentials: true
+
+                - bash: |
+                    RESPONSE=$(curl --insecure --silent -X POST \
+                      -H "Content-Type: application/json" \
+                      -d "{\"username\":\"$(ADEPTIA_IMPORT_USERNAME)\",\"password\":\"$(ADEPTIA_IMPORT_PASSWORD)\"}" \
+                      "$(IMPORT_APP_URL)/rest/login/user")
+                    TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ACCESS_TOKEN',''))")
+                    if [ -z "$TOKEN" ]; then echo "Login failed: $RESPONSE"; exit 1; fi
+                    echo "##vso[task.setvariable variable=ADEPTIA_TOKEN;isSecret=true]$TOKEN"
+                    echo "Login successful"
+                  displayName: Login to Adeptia
+
+                - bash: |
+                    RESPONSE=$(curl --insecure --silent \
+                      -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                      --form "sourceZipFile=@\"$(zip_path)\"" \
+                      --form "generateRollbackPackage=true" \
+                      "$(IMPORT_APP_URL)/rest/migration/import/execute/$(IMPORT_PKG_ID)")
+                    echo "Response: $RESPONSE"
+                    SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))")
+                    REF_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('referenceId',''))")
+                    if [ "$SUCCESS" != "True" ] && [ "$SUCCESS" != "true" ]; then echo "Import trigger failed for Production: $RESPONSE"; exit 1; fi
+                    echo "##vso[task.setvariable variable=REF_ID]$REF_ID"
+                    echo "Import triggered. Reference ID: $REF_ID"
+                  displayName: Trigger import
+
+                - bash: |
+                    STATUS=""
+                    for i in $(seq 1 15); do
+                      RESPONSE=$(curl --insecure --silent \
+                        -H "ACCESS_TOKEN: $(ADEPTIA_TOKEN)" \
+                        "$(IMPORT_APP_URL)/rest/migration/status?id=$(REF_ID)")
+                      STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','').upper())")
+                      echo "Attempt $i/15 [Production]: $STATUS"
+                      if [ "$STATUS" = "FINISHED" ]; then break; fi
+                      [ $i -lt 15 ] && sleep 30
+                    done
+                    if [ "$STATUS" != "FINISHED" ]; then echo "Import timed out for Production"; exit 1; fi
+                  displayName: Poll import status
+
+                - bash: |
+                    ROLLBACK_NAME="$(package_base)-Production-rollback.zip"
+                    ROLLBACK_PATH="rollback/${ROLLBACK_NAME}"
+                    mkdir -p rollback
+                    for r in $(seq 1 5); do
+                      HTTP=$(curl --insecure --silent \
+                        --cookie "ACCESS_TOKEN=$(ADEPTIA_TOKEN)" \
+                        "$(IMPORT_APP_URL)/rest/migration/downloadzip?id=$(REF_ID)&type=rollbackzip" \
+                        --output "$ROLLBACK_PATH" --write-out "%{http_code}")
+                      echo "Rollback download attempt $r: HTTP $HTTP"
+                      [ "$HTTP" = "200" ] && break
+                      [ $r -lt 5 ] && sleep 30
+                    done
+                    git config user.name "azure-pipelines"
+                    git config user.email "ci-service@adeptia.com"
+                    git add "$ROLLBACK_PATH"
+                    git diff --cached --quiet || (
+                      git commit -m "rollback: ${ROLLBACK_NAME} [promoted to Production]"
+                      git pull --rebase origin main
+                      git push origin HEAD:main
+                    )
+                  displayName: Download and commit rollback ZIP
+
+  - stage: CreateTag
+    displayName: Create release tag
+    dependsOn:
+      - Setup
+      - ImportQA
+      - ImportStage
+      - ImportProduction
+    condition: |
+      and(
+        succeeded('Setup'),
+        in(dependencies.ImportQA.result, 'Succeeded', 'Skipped'),
+        in(dependencies.ImportStage.result, 'Succeeded', 'Skipped'),
+        in(dependencies.ImportProduction.result, 'Succeeded', 'Skipped'),
+        or(
+          eq(dependencies.ImportQA.result, 'Succeeded'),
+          eq(dependencies.ImportStage.result, 'Succeeded'),
+          eq(dependencies.ImportProduction.result, 'Succeeded')
+        )
+      )
+    variables:
+      zip_name: $[ stageDependencies.Setup.ReadConfig.outputs['config.zip_name'] ]
+      package_base: $[ stageDependencies.Setup.ReadConfig.outputs['config.package_base'] ]
+      qa_result: $[ dependencies.ImportQA.result ]
+      stage_result: $[ dependencies.ImportStage.result ]
+      prod_result: $[ dependencies.ImportProduction.result ]
+    jobs:
+      - job: TagRelease
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - bash: |
+              RELEASE_DATE=$(date +%Y-%m-%d)
+              IMPORTED_ENVS=""
+              [ "$(qa_result)"    = "Succeeded" ] && IMPORTED_ENVS="${IMPORTED_ENVS}QA, "          || true
+              [ "$(stage_result)" = "Succeeded" ] && IMPORTED_ENVS="${IMPORTED_ENVS}Stage, "       || true
+              [ "$(prod_result)"  = "Succeeded" ] && IMPORTED_ENVS="${IMPORTED_ENVS}Production, "  || true
+              IMPORTED_ENVS="${IMPORTED_ENVS%, }"
+
+              TAG="$(package_base)-release-${RELEASE_DATE}"
+              git tag -a "$TAG" -m "Imported $(package_base) to ${IMPORTED_ENVS} on ${RELEASE_DATE}" || echo "Tag already exists, skipping"
+              git push origin "$TAG" || echo "Tag push skipped"
+
+              echo ""
+              echo "=== Promote Summary ==="
+              echo "Package     : $(package_base)"
+              echo "Imported to : ${IMPORTED_ENVS}"
+              echo "Date        : ${RELEASE_DATE}"
+              echo "ZIP         : $(zip_name)"
+              echo "Run ID      : $(Build.BuildId)"
+            displayName: Tag release and print summary
