@@ -147,6 +147,7 @@ jobs:
             -d "$PAYLOAD")
 
           PR_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('pullRequestId',''))")
+          if [ -z "$PR_ID" ]; then echo "PR creation failed. Response: $RESPONSE"; exit 1; fi
           echo "Pull Request created: $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)/pullrequest/${PR_ID}"
           echo "Merge the PR to trigger automatic import to: $(TARGET_ENVS)"
         displayName: Commit to branch and create PR
