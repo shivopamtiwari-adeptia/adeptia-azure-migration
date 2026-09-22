@@ -136,15 +136,9 @@ jobs:
           git push origin HEAD:"$(PR_BRANCH)"
 
           EXPORT_ENV="${{ parameters.export_environment }}"
-          PAYLOAD=$(python3 -c "
-import json, sys
-print(json.dumps({
-  'title': 'Promote: ' + sys.argv[1] + ' -> ' + sys.argv[2],
-  'sourceRefName': 'refs/heads/' + sys.argv[3],
-  'targetRefName': 'refs/heads/main',
-  'description': '## Promote Package\n\n| Field | Value |\n|---|---|\n| **Package** | ' + sys.argv[1] + ' |\n| **Export Env** | ' + sys.argv[4] + ' |\n| **Target Envs** | ' + sys.argv[2] + ' |\n| **Run** | $(Build.BuildId) |\n\nMerge this PR to trigger automatic import to: ' + sys.argv[2]
-}))
-" "$(PACKAGE_BASE)" "$(TARGET_ENVS)" "$(PR_BRANCH)" "$EXPORT_ENV")
+          PR_TITLE="Promote: $(PACKAGE_BASE) -> $(TARGET_ENVS)"
+          PR_DESC="## Promote Package\n\n| Field | Value |\n|---|---|\n| **Package** | $(PACKAGE_BASE) |\n| **Export Env** | ${EXPORT_ENV} |\n| **Target Envs** | $(TARGET_ENVS) |\n| **Run** | $(Build.BuildId) |\n\nMerge this PR to trigger automatic import to: $(TARGET_ENVS)"
+          PAYLOAD=$(PR_TITLE="$PR_TITLE" PR_DESC="$PR_DESC" PR_BRANCH="$(PR_BRANCH)" python3 -c "import json,os; print(json.dumps({'title':os.environ['PR_TITLE'],'sourceRefName':'refs/heads/'+os.environ['PR_BRANCH'],'targetRefName':'refs/heads/main','description':os.environ['PR_DESC']}))")
 
           RESPONSE=$(curl --insecure --silent -X POST \
             -H "Content-Type: application/json" \
