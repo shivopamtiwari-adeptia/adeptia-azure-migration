@@ -1,6 +1,7 @@
 name: Rollback
 
 trigger: none
+pr: none
 
 parameters:
   - name: source_zip_name
