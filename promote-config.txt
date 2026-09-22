@@ -1,2 +1,2 @@
-ZIP_PATH=artifacts/dev/SOL-test-v1.2.0-B2946-20260922-DEV.zip
+ZIP_PATH=artifacts/dev/SOL-test1-v1-B2953-20260922-DEV.zip
 TARGET_ENVS=QA
